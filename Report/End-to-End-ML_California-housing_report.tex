@@ -1,0 +1,304 @@
+\documentclass[11pt]{article}
+
+% ---------- Packages ----------
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath, amssymb}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue]{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{parskip}
+
+\graphicspath{{figures/}}
+
+% ---------- Python listing style ----------
+\lstdefinestyle{python}{
+	language=Python,
+	basicstyle=\ttfamily\small,
+	keywordstyle=\color{blue!70!black}\bfseries,
+	commentstyle=\color{gray!70!black}\itshape,
+	stringstyle=\color{orange!70!black},
+	showstringspaces=false,
+	breaklines=true,
+	frame=single,
+	numbers=left,
+	numberstyle=\tiny\color{gray},
+	tabsize=4
+}
+\lstset{style=python}
+
+% ---------- Note/Tip/Caution callouts ----------
+\newcommand{\bookcite}[1]{\textit{Source: Géron, A.\ \emph{Hands-On Machine Learning with Scikit-Learn, Keras \& TensorFlow}, 3rd ed., O'Reilly, 2022 -- #1.}}
+
+\newenvironment{note}[1][Note]
+{\par\vspace{4pt}\noindent\textbf{#1.}\itshape\ }
+{\par\vspace{4pt}}
+
+\begin{document}
+	
+	\begin{center}
+		{\LARGE \textbf{End-to-End Machine Learning Project}}\\[4pt]
+		{\large Part 3: Selecting, Fine-Tuning, and Deploying a Model}\\[4pt]
+		{\normalsize Resana --- Internship Report}
+	\end{center}
+	
+	\vspace{6pt}
+	
+	This document continues the working reference I've been keeping during my internship at Resana, based on Chapter 2 of \emph{Hands-On Machine Learning with Scikit-Learn, Keras \& TensorFlow} (Aurélien Géron, 3rd ed.). By this point the California housing dataset has already been explored and run through the \texttt{preprocessing} pipeline built earlier (ratio features, log-transforms, geographic cluster similarity, and one-hot encoding for the categorical column) -- so this part picks up right where that left off: training and comparing baseline models, getting a trustworthy estimate of generalization error with cross-validation, fine-tuning the most promising model, inspecting what it actually learned, evaluating it on the test set, and finally packaging and shipping it. All numbers below are taken directly from my own notebook run on the housing dataset, not from the book's example.
+	
+	\tableofcontents
+	\vspace{12pt}
+	
+	% =====================================================================
+	\section{Select and Train a Model}
+	% =====================================================================
+	
+	% ---------------------------------------------------------------------
+	\subsection{Train and Evaluate on the Training Set}
+	% ---------------------------------------------------------------------
+	
+	With the data cleaned up and the preprocessing pipeline ready, the obvious first move is the simplest possible baseline: a plain linear regression, wrapped together with the preprocessing pipeline so the two train as one unit.
+	
+	\begin{lstlisting}[language=Python]
+		from sklearn.linear_model import LinearRegression
+		
+		lin_reg = make_pipeline(preprocessing, LinearRegression())
+		lin_reg.fit(housing, housing_labels)
+	\end{lstlisting}
+	
+	Comparing the first few predictions against the real labels shows the model is in the right ballpark but far from precise -- some districts are off by tens of thousands of dollars. To put a single number on this, I measured the RMSE on the training set itself:
+	
+	\begin{lstlisting}[language=Python]
+		from sklearn.metrics import root_mean_squared_error
+		
+		lin_rmse = root_mean_squared_error(housing_labels, housing_predictions)
+	\end{lstlisting}
+	
+	\begin{note}[Deprecation note]
+		Older code (and the book's earlier editions) computed RMSE via \texttt{mean\_squared\_error(y\_true, y\_pred, squared=False)}. That \texttt{squared} argument is deprecated in recent Scikit-Learn versions -- \texttt{root\_mean\_squared\_error} is the direct replacement.
+	\end{note}
+	
+	This gave \texttt{lin\_rmse} $\approx \$69{,}123$. Since most district values fall between \$120,000 and \$265,000, a typical prediction error of \$69k is not very satisfying -- a textbook case of \emph{underfitting}: either the features don't carry enough signal for a linear model, or the model itself is simply too constrained for the underlying pattern.
+	
+	As a next step I tried a \texttt{DecisionTreeRegressor}, a model capable of finding much more complex, nonlinear relationships in the data:
+	
+	\begin{lstlisting}[language=Python]
+		from sklearn.tree import DecisionTreeRegressor
+		
+		tree_reg = make_pipeline(preprocessing, DecisionTreeRegressor(random_state=42))
+		tree_reg.fit(housing, housing_labels)
+	\end{lstlisting}
+	
+	Evaluated the same way, this model scored \texttt{tree\_rmse} $= 0.0$ -- literally zero error. That is not a sign of a great model; it's a sign that the tree simply memorized the training set instead of learning a pattern that generalizes. Evaluating a model on the exact same data it was trained on is close to meaningless, and touching the test set this early would be a mistake too -- it needs to stay untouched until I'm confident enough in a model to commit to it. What's needed instead is a way to evaluate on data the model hasn't seen, without spending the test set.
+	
+	% ---------------------------------------------------------------------
+	\subsection{Better Evaluation Using Cross-Validation}
+	% ---------------------------------------------------------------------
+	
+	Scikit-Learn's $k$-fold cross-validation solves exactly this: it randomly splits the training set into $k$ non-overlapping folds, then trains and evaluates the model $k$ times, each time holding out a different fold for validation and training on the rest.
+	
+	\begin{lstlisting}[language=Python]
+		from sklearn.model_selection import cross_val_score
+		
+		tree_rmses = -cross_val_score(tree_reg, housing, housing_labels,
+		scoring="neg_root_mean_squared_error",
+		cv=10)
+	\end{lstlisting}
+	
+	\begin{note}[Caution]
+		Scikit-Learn's cross-validation tooling expects a \emph{utility} function (higher is better), not a cost function, so \texttt{scoring} here is actually the negative of RMSE. That's why the sign has to be flipped back with the leading \texttt{-}.
+	\end{note}
+	
+	Summarizing the 10 fold scores with \texttt{pd.Series(tree\_rmses).describe()} gave a mean RMSE of about \$67,647 with a standard deviation of about \$2,619. So the decision tree, despite scoring a perfect 0 on the training set, performs roughly as poorly as the linear model once evaluated on data it hasn't memorized -- and cross-validation now also tells me \emph{how} precise that estimate is (the standard deviation), which a single train/test split never would. The gap between a training error of 0 and a cross-validation error of \$67.6k is a clean, quantitative confirmation of the overfitting I suspected above.
+	
+	Next up, a \texttt{RandomForestRegressor} -- an \emph{ensemble} method that trains many decision trees, each on a random subset of features, and averages their predictions:
+	
+	\begin{lstlisting}[language=Python]
+		from sklearn.ensemble import RandomForestRegressor
+		
+		forest_reg = make_pipeline(preprocessing,
+		RandomForestRegressor(random_state=42))
+		forest_rmses = -cross_val_score(forest_reg, housing, housing_labels,
+		scoring="neg_root_mean_squared_error", cv=10)
+	\end{lstlisting}
+	
+	This came out to a mean RMSE of about \$47,313 (std $\approx$ \$2,389) -- clearly the best of the three so far, and a big jump over both the linear model and the single decision tree. Random forests are still not immune to overfitting, though: the book's own worked example on this same setup shows a training RMSE around \$17,474 for a random forest, i.e.\ well below its cross-validation score, meaning there's still a real (if much smaller) gap between training and validation performance. Still, with several reasonable candidates compared, the random forest is clearly the most promising one to carry forward and fine-tune -- so that's the shortlist for the next section.
+	
+	% =====================================================================
+	\section{Fine-Tune Your Model}
+	% =====================================================================
+	
+	% ---------------------------------------------------------------------
+	\subsection{Grid Search}
+	% ---------------------------------------------------------------------
+	
+	Rather than hand-tweaking hyperparameters, Scikit-Learn's \texttt{GridSearchCV} can search a defined grid of values automatically, cross-validating every combination. To target hyperparameters that live \emph{inside} the preprocessing pipeline (like the number of geographic clusters) as well as the model's own hyperparameters, the pipeline steps need names -- which means switching from \texttt{make\_pipeline} to \texttt{Pipeline}:
+	
+	\begin{lstlisting}[language=Python]
+		from sklearn.model_selection import GridSearchCV
+		from sklearn.pipeline import Pipeline
+		
+		full_pipeline = Pipeline([
+		("preprocessing", preprocessing),
+		("random_forest", RandomForestRegressor(random_state=42)),
+		])
+		param_grid = [
+		{'preprocessing__geo__n_clusters': [5, 8, 10],
+			'random_forest__max_features': [4, 6, 8]},
+		{'preprocessing__geo__n_clusters': [10, 15],
+			'random_forest__max_features': [6, 8, 10]},
+		]
+		
+		grid_search = GridSearchCV(full_pipeline, param_grid, cv=3,
+		scoring='neg_root_mean_squared_error')
+		grid_search.fit(housing, housing_labels)
+	\end{lstlisting}
+	
+	The double-underscore naming (\texttt{preprocessing\_\_geo\_\_n\_clusters}) is how Scikit-Learn reaches through nested steps: go into the \texttt{"preprocessing"} step, find the sub-transformer named \texttt{"geo"} inside it, and set its \texttt{n\_clusters} parameter. Same idea for \texttt{random\_forest\_\_max\_features}, which just refers to the \texttt{RandomForestRegressor} step directly.
+	
+	\begin{note}[Tip]
+		Tuning preprocessing hyperparameters together with the model's is worthwhile because they often interact -- e.g.\ more clusters may call for a higher \texttt{max\_features} too. If any preprocessing step is expensive to recompute, the pipeline's \texttt{memory} hyperparameter can point to a caching directory so identical steps aren't rerun for every combination that shares them.
+	\end{note}
+	
+	With two dictionaries of 9 and 6 combinations respectively (15 total) and \texttt{cv=3}, this amounts to 45 rounds of training in total. The winning combination was:
+	
+	\begin{lstlisting}[language=Python]
+		>>> grid_search.best_params_
+		{'preprocessing__geo__n_clusters': 15, 'random_forest__max_features': 6}
+	\end{lstlisting}
+	
+	which corresponds to a mean cross-validation RMSE of about \$44,366 -- already a solid improvement over the untuned forest's \$47,313. Sorting \texttt{grid\_search.cv\_results\_} by score surfaces something worth flagging: two of the top rows (\texttt{n\_clusters=10}, \texttt{max\_features=6}) are tied with the exact same score, down to the decimal. That's not a coincidence -- it's because my two \texttt{param\_grid} dictionaries overlap at that one combination (10 appears in both \texttt{n\_clusters} lists, 6 in both \texttt{max\_features} lists), so \texttt{GridSearchCV} trained and scored it twice without me noticing. It didn't change the outcome here, but it's wasted compute, and worth double-checking for next time -- whenever \texttt{param\_grid} is a list of several dictionaries, it's worth checking they don't overlap.
+	
+	% ---------------------------------------------------------------------
+	\subsection{Randomized Search}
+	% ---------------------------------------------------------------------
+	
+	Grid search is fine for a handful of values, but it doesn't scale: exploring a wider range means testing every combination, which grows very fast. \texttt{RandomizedSearchCV} instead samples a fixed number of combinations from a distribution, which means the size of the search space no longer has to match the compute budget:
+	
+	\begin{lstlisting}[language=Python]
+		from sklearn.model_selection import RandomizedSearchCV
+		from scipy.stats import randint
+		
+		param_distribs = {'preprocessing__geo__n_clusters': randint(low=3, high=50),
+			'random_forest__max_features': randint(low=2, high=20)}
+		
+		rnd_search = RandomizedSearchCV(
+		full_pipeline, param_distributions=param_distribs, n_iter=10, cv=3,
+		scoring='neg_root_mean_squared_error', random_state=42)
+		
+		rnd_search.fit(housing, housing_labels)
+	\end{lstlisting}
+	
+	Even with only 10 iterations (versus grid search's 15 combinations), this explored a much wider range of \texttt{n\_clusters} (up to 50, instead of maxing out at 15) and found a better solution:
+	
+	\begin{lstlisting}[language=Python]
+		>>> rnd_search.best_params_
+		{'preprocessing__geo__n_clusters': 45, 'random_forest__max_features': 9}
+	\end{lstlisting}
+	
+	with a mean cross-validation RMSE of about \$42,634 -- noticeably better than grid search's \$44,366, and with fewer total fits. That's the practical case for randomized search: it isn't guaranteed to beat a grid search over the same set of values, but it lets you search a much larger space for a fixed, predictable amount of compute. (The book also mentions \texttt{HalvingGridSearchCV} / \texttt{HalvingRandomSearchCV} as a further refinement -- they screen candidates cheaply on a small subset of the data first, then only spend full resources on the survivors in later rounds.)
+	
+	% ---------------------------------------------------------------------
+	\subsection{Ensemble Methods}
+	% ---------------------------------------------------------------------
+	
+	Beyond tuning a single model, a further way to squeeze out performance is to combine several of the best-performing models into one \emph{ensemble} -- the same idea a random forest already applies internally, just one level up. Different model types tend to make different kinds of errors, so averaging their predictions (e.g.\ a fine-tuned random forest together with a fine-tuned $k$-nearest-neighbors regressor) often outperforms any single model in the group. I didn't build one for this project, but it's a natural next step if further gains were needed.
+	
+	% ---------------------------------------------------------------------
+	\subsection{Analyzing the Best Models and Their Errors}
+	% ---------------------------------------------------------------------
+	
+	A trained \texttt{RandomForestRegressor} can report how much each input feature contributed to its predictions, which is a good way to sanity-check the model (and the feature engineering that fed it):
+	
+	\begin{lstlisting}[language=Python]
+		final_model = rnd_search.best_estimator_
+		feature_importances = final_model["random_forest"].feature_importances_
+		
+		sorted(zip(feature_importances,
+		final_model["preprocessing"].get_feature_names_out()),
+		reverse=True)
+	\end{lstlisting}
+	
+	The full list runs to dozens of entries (mostly the individual geographic cluster-similarity features), but the top of the ranking is where the story is:
+	
+	\begin{center}
+		\small
+		\begin{tabular}{@{}lc@{}}
+			\toprule
+			\textbf{Feature} & \textbf{Importance} \\
+			\midrule
+			\texttt{log\_\_median\_income} & 0.181 \\
+			\texttt{cat\_\_ocean\_proximity\_INLAND} & 0.082 \\
+			\texttt{bedrooms\_\_ratio} & 0.072 \\
+			\texttt{rooms\_per\_house\_\_ratio} & 0.058 \\
+			\texttt{people\_per\_house\_\_ratio} & 0.050 \\
+			\texttt{geo\_\_Clusters 2 similarity} & 0.032 \\
+			\texttt{geo\_\_Clusters 43 similarity} & 0.028 \\
+			\bottomrule
+		\end{tabular}
+	\end{center}
+	
+	\texttt{median\_income} dominates, by a clear margin -- consistent with what the correlation analysis already hinted at earlier in the project. Encouragingly, the three \emph{engineered} ratio features (bedrooms, rooms-per-house, people-per-house) all rank above almost every individual geographic cluster, which suggests that feature engineering step was worth doing. At the opposite end of the list, a handful of features (e.g.\ the rarer \texttt{ocean\_proximity} categories, or clusters far from any real geographic pattern) contribute next to nothing.
+	
+	\begin{note}[Tip]
+		\texttt{sklearn.feature\_selection.SelectFromModel} can automate this: after fitting, it looks at \texttt{feature\_importances\_} and keeps only the most useful features, so the low-value ones above could be dropped programmatically instead of by hand.
+	\end{note}
+	
+	% ---------------------------------------------------------------------
+	\subsection{Evaluate Your System on the Test Set}
+	% ---------------------------------------------------------------------
+	
+	With a fine-tuned model finally chosen, this is the one and only point where the test set gets touched:
+	
+	\begin{lstlisting}[language=Python]
+		X_test = strat_test_set.drop("median_house_value", axis=1)
+		y_test = strat_test_set["median_house_value"].copy()
+		
+		final_predictions = final_model.predict(X_test)
+		final_rmse = root_mean_squared_error(y_test, final_predictions)
+	\end{lstlisting}
+	
+	This gave \texttt{final\_rmse} $\approx \$39{,}565$ -- actually a bit better than the \$42,634 cross-validation estimate. That can happen by chance, but it's not something to chase: tweaking hyperparameters afterwards to make the test-set number look even better would just mean overfitting to the test set itself, at which point it stops being a trustworthy estimate of real-world performance.
+	
+	Since a single number doesn't say much about how \emph{precise} that estimate is, I also computed a 95\% confidence interval for the generalization error:
+	
+	\begin{lstlisting}[language=Python]
+		from scipy import stats
+		
+		confidence = 0.95
+		squared_errors = (final_predictions - y_test) ** 2
+		np.sqrt(stats.t.interval(confidence, len(squared_errors) - 1,
+		loc=squared_errors.mean(),
+		scale=stats.sem(squared_errors)))
+	\end{lstlisting}
+	
+	which came out to roughly $\$[37{,}712,\ 41{,}336]$. In other words, I can say with 95\% confidence that the model's true generalization error falls somewhere in that \$3.6k-wide band -- a single point estimate of \$39,565 on its own wouldn't have conveyed how tight (or loose) that estimate actually is.
+	
+	% =====================================================================
+	\section{Launch, Monitor, and Maintain Your System}
+	% =====================================================================
+	
+	Getting a model this far is not the finish line -- it still has to be packaged, shipped, and kept healthy in production. The simplest deployment path is to save the trained pipeline and load it wherever it needs to run:
+	
+	\begin{lstlisting}[language=Python]
+		import joblib
+		
+		joblib.dump(final_model, "my_california_housing_model.pkl")
+	\end{lstlisting}
+	
+	Since \texttt{final\_model} is the \emph{entire} pipeline -- preprocessing and all, not just the bare \texttt{RandomForestRegressor} -- calling \texttt{.predict()} on raw, unprocessed input automatically runs it through the same preprocessing before making a prediction. One catch: \texttt{joblib} only serializes data and parameters, not code. Any custom classes or functions the pipeline depends on (like the \texttt{ClusterSimilarity} transformer built earlier for the geo features) have to be defined or imported again in whatever environment loads the model -- otherwise unpickling it will fail.
+	
+	\begin{note}[Tip]
+		It's worth saving every model tried along the way, not just the final one -- together with its cross-validation scores and, ideally, its actual predictions on the validation set. That makes it easy to come back later, compare error types across model versions, or roll back if a newer model turns out worse.
+	\end{note}
+	
+	Depending on the use case, this saved pipeline can be loaded directly inside the application, wrapped in a separate web service (e.g.\ a REST API the app calls over the network), or deployed on a managed cloud platform (like Vertex AI) that takes care of scaling and load balancing on its own.
+	
+	Shipping the model isn't the end, either -- performance tends to decay slowly over time as the real world drifts away from what the training data captured, a phenomenon generally called \emph{model rot} or \emph{data drift}. Catching this requires ongoing monitoring, either through a downstream business metric (e.g.\ a drop in the click-through or sales rate of recommended products) or through periodic human review of a sample of the model's predictions. Ideally the retraining loop itself is automated: fresh data gets collected, a new model is trained and tuned on it, and it only replaces the live model if it actually beats it on an up-to-date test set. It's also worth monitoring the \emph{input} data quality on its own -- a spike in missing values, a statistical shift away from the training distribution, or entirely new categories showing up are all early warning signs, often before the output quality visibly drops. Finally, keeping backups of every model and every dataset version is what makes a quick rollback possible if something does go wrong.
+	
+	With the model trained, tuned, evaluated, and now deployed with a monitoring plan in place, the end-to-end workflow this project set out to build -- starting from raw housing data all the way to a served prediction -- is complete.
+	
+\end{document}
